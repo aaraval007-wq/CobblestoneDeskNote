@@ -14,7 +14,7 @@
       chart2_prices.png           — TTF / EUA / German power panel
 
   Requirements:
-      pip install requests pandas matplotlib numpy reportlab
+      pip install requests pandas matplotlib numpy
 
   API keys (set as environment variables OR edit CONFIG below):
       GEMINI_API_KEY      — for AI narrative (free at aistudio.google.com)
@@ -33,15 +33,6 @@ import logging
 import requests
 import warnings
 import numpy as np
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Image,
-    Table, TableStyle, HRFlowable
-)
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -59,7 +50,7 @@ CONFIG = {
 
     # Google Gemini API key — free at aistudio.google.com (no credit card needed)
     # Set env var GEMINI_API_KEY or paste key directly here
-    "gemini_api_key": os.getenv("GEMINI_API_KEY", "YOUR_KEY_HERE"),
+    "gemini_api_key": os.getenv("GEMINI_API_KEY", "AIzaSyDOL4lGCc0LW4M_j3lz__ONR2O4rwEyhhg"),
 
     # ENTSO-E API key — optional, improves power price accuracy
     "entsoe_api_key": os.getenv("ENTSOE_API_KEY", ""),
@@ -741,330 +732,6 @@ def fmt_pct(v) -> str:
     return f"{v:+.1f}%"
 
 
-def write_pdf(data: dict, metrics: dict, narrative: str,
-              chart1: Path, chart2: Path) -> Path:
-    """
-    Render the daily brief as a clean A4 PDF using reportlab.
-    Mirrors the structure of the markdown brief.
-    """
-    log.info("Generating PDF brief")
-
-    # ── colours ──────────────────────────────────────────────────────────────
-    C_BG     = colors.HexColor("#ffffff")
-    C_PANEL  = colors.HexColor("#f6f8fa")
-    C_BORDER = colors.HexColor("#d0d7de")
-    C_TEXT   = colors.HexColor("#1a1a2e")
-    C_MUTED  = colors.HexColor("#57606a")
-    C_BLUE   = colors.HexColor("#0969da")
-    C_GREEN  = colors.HexColor("#1a7f37")
-    C_RED    = colors.HexColor("#cf222e")
-    C_GOLD   = colors.HexColor("#9a6700")
-
-    PAGE_W, PAGE_H = A4
-    M = 18 * mm
-
-    # ── styles ────────────────────────────────────────────────────────────────
-    def sty(name, **kw):
-        base = dict(fontName="Helvetica", fontSize=9, leading=13, textColor=C_TEXT)
-        base.update(kw)
-        return ParagraphStyle(name, **base)
-
-    st_h1    = sty("h1", fontSize=12, fontName="Helvetica-Bold",
-                   textColor=C_BLUE, spaceBefore=10, spaceAfter=4)
-    st_h2    = sty("h2", fontSize=9.5, fontName="Helvetica-Bold",
-                   textColor=C_GOLD, spaceBefore=6, spaceAfter=3)
-    st_body  = sty("body", fontSize=8.8, leading=13.5,
-                   alignment=TA_JUSTIFY, spaceAfter=5)
-    st_mono  = sty("mono", fontName="Courier", fontSize=8.5,
-                   textColor=C_GREEN, leftIndent=14, spaceAfter=4)
-    st_cap   = sty("cap", fontSize=7.2, textColor=C_MUTED,
-                   alignment=TA_CENTER, spaceAfter=6)
-    st_foot  = sty("foot", fontSize=7, textColor=C_MUTED, alignment=TA_CENTER)
-    st_title = sty("title", fontSize=20, fontName="Helvetica-Bold",
-                   leading=24, spaceAfter=2)
-    st_sub   = sty("sub", fontSize=10, textColor=C_MUTED, spaceAfter=4)
-
-    def HR(color=C_BORDER, thick=0.5):
-        return HRFlowable(width="100%", thickness=thick,
-                          color=color, spaceBefore=4, spaceAfter=6)
-
-    def sp(pt=6):
-        return Spacer(1, pt)
-
-    def bold(text):
-        """Inline bold via <b> tags."""
-        return text  # Paragraph handles <b> tags natively
-
-    # ── header/footer callback ────────────────────────────────────────────────
-    def on_page(canvas, doc):
-        canvas.saveState()
-        canvas.setFillColor(C_PANEL)
-        canvas.rect(0, PAGE_H - 9*mm, PAGE_W, 9*mm, fill=1, stroke=0)
-        canvas.setFillColor(C_BLUE)
-        canvas.rect(0, PAGE_H - 9*mm, 2*mm, 9*mm, fill=1, stroke=0)
-        canvas.setFont("Helvetica-Bold", 7)
-        canvas.setFillColor(C_TEXT)
-        canvas.drawString(M, PAGE_H - 5.5*mm, "EUROPEAN CROSS-COMMODITY RISK MONITOR")
-        canvas.setFont("Helvetica", 7)
-        canvas.setFillColor(C_MUTED)
-        canvas.drawRightString(PAGE_W - M, PAGE_H - 5.5*mm,
-                               f"{data['as_of']}  |  Aarav Agarwal")
-        canvas.setFont("Helvetica", 6.5)
-        canvas.setFillColor(C_MUTED)
-        canvas.drawCentredString(PAGE_W / 2, 7*mm,
-            "For informational purposes only. Not financial advice.")
-        canvas.restoreState()
-
-    # ── kv table ──────────────────────────────────────────────────────────────
-    CW = PAGE_W - 2 * M
-    def kv_table(rows):
-        col = [55*mm, CW - 55*mm]
-        tdata = [[
-            Paragraph(f"<b>{k}</b>", ParagraphStyle("k", fontSize=8,
-                      textColor=C_MUTED, fontName="Helvetica-Bold", leading=11)),
-            Paragraph(v, ParagraphStyle("v", fontSize=8.8,
-                      textColor=C_TEXT, leading=12))
-        ] for k, v in rows]
-        tbl = Table(tdata, colWidths=col)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), C_PANEL),
-            ("GRID",       (0,0), (-1,-1), 0.3, C_BORDER),
-            ("TOPPADDING",    (0,0), (-1,-1), 5),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-            ("LEFTPADDING",   (0,0), (-1,-1), 8),
-            ("RIGHTPADDING",  (0,0), (-1,-1), 8),
-            ("VALIGN",        (0,0), (-1,-1), "TOP"),
-        ]))
-        return tbl
-
-    def metrics_table(rows):
-        cw = [52*mm, 26*mm, 26*mm, CW - 108*mm]
-        hdr = [Paragraph(h, ParagraphStyle("mh", fontSize=7.5,
-               fontName="Helvetica-Bold", textColor=C_MUTED, leading=10))
-               for h in ["Metric", "Value", "Signal", "Relevance"]]
-        tdata = [hdr]
-        for metric, value, sig, rel in rows:
-            sc = C_GREEN if "BULLISH" in sig else (C_RED if "BEARISH" in sig else C_GOLD)
-            tdata.append([
-                Paragraph(metric, ParagraphStyle("mc", fontSize=8,
-                          textColor=C_TEXT, leading=11)),
-                Paragraph(value,  ParagraphStyle("mv", fontSize=8,
-                          fontName="Helvetica-Bold", textColor=C_BLUE, leading=11)),
-                Paragraph(sig,    ParagraphStyle("ms", fontSize=7.5,
-                          fontName="Helvetica-Bold", textColor=sc, leading=10)),
-                Paragraph(rel,    ParagraphStyle("mr", fontSize=7.8,
-                          textColor=C_MUTED, leading=11)),
-            ])
-        tbl = Table(tdata, colWidths=cw, repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND",   (0,0), (-1,0),  C_BORDER),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_PANEL, colors.HexColor("#ffffff")]),
-            ("GRID",         (0,0), (-1,-1), 0.3, C_BORDER),
-            ("TOPPADDING",    (0,0), (-1,-1), 5),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-            ("LEFTPADDING",   (0,0), (-1,-1), 7),
-            ("RIGHTPADDING",  (0,0), (-1,-1), 7),
-            ("VALIGN",        (0,0), (-1,-1), "TOP"),
-        ]))
-        return tbl
-
-    # ── signal badge table ────────────────────────────────────────────────────
-    def signal_table(summary):
-        cw3 = [CW/3, CW/3, CW/3]
-        tdata = [[
-            Paragraph("<b>🟢 Bullish</b>", ParagraphStyle("sb", fontSize=9,
-                      fontName="Helvetica-Bold", textColor=C_GREEN,
-                      alignment=TA_CENTER, leading=12)),
-            Paragraph("<b>🟡 Neutral</b>", ParagraphStyle("sn", fontSize=9,
-                      fontName="Helvetica-Bold", textColor=C_GOLD,
-                      alignment=TA_CENTER, leading=12)),
-            Paragraph("<b>🔴 Bearish</b>", ParagraphStyle("sr", fontSize=9,
-                      fontName="Helvetica-Bold", textColor=C_RED,
-                      alignment=TA_CENTER, leading=12)),
-        ],[
-            Paragraph(f"<b>{summary['bullish']}</b>",
-                      ParagraphStyle("sv", fontSize=18, fontName="Helvetica-Bold",
-                                     textColor=C_GREEN, alignment=TA_CENTER, leading=22)),
-            Paragraph(f"<b>{summary['neutral']}</b>",
-                      ParagraphStyle("sv2", fontSize=18, fontName="Helvetica-Bold",
-                                     textColor=C_GOLD, alignment=TA_CENTER, leading=22)),
-            Paragraph(f"<b>{summary['bearish']}</b>",
-                      ParagraphStyle("sv3", fontSize=18, fontName="Helvetica-Bold",
-                                     textColor=C_RED, alignment=TA_CENTER, leading=22)),
-        ]]
-        tbl = Table(tdata, colWidths=cw3)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND",    (0,0), (-1,-1), C_PANEL),
-            ("GRID",          (0,0), (-1,-1), 0.3, C_BORDER),
-            ("TOPPADDING",    (0,0), (-1,-1), 8),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-            ("ALIGN",         (0,0), (-1,-1), "CENTER"),
-        ]))
-        return tbl
-
-    # ── build story ───────────────────────────────────────────────────────────
-    m    = metrics
-    stor = data["storage"]
-    today_str = datetime.today().strftime("%Y-%m-%d")
-    out_path  = OUT / f"daily_brief_{today_str}.pdf"
-
-    doc = SimpleDocTemplate(
-        str(out_path), pagesize=A4,
-        leftMargin=M, rightMargin=M, topMargin=M + 4*mm, bottomMargin=14*mm,
-    )
-
-    def yoy(key):
-        v = data.get(f"{key}_yoy")
-        return f" ({v:+.1f}% YoY)" if v else ""
-
-    story = []
-    a = story.append
-
-    # Title
-    a(sp(4))
-    a(Paragraph("European Cross-Commodity Risk Monitor", st_title))
-    a(Paragraph("Gas Tightness  ·  Carbon Supply Signal  ·  Power Curve Implications", st_sub))
-    a(Paragraph(f"Aarav Agarwal  |  {data['as_of']}", st_sub))
-    a(HR(C_BLUE, thick=1.2))
-
-    # Signal summary
-    a(Paragraph("Signal Summary", st_h1))
-    a(signal_table(m["_summary"]))
-    a(sp(8))
-    a(HR())
-
-    # Narrative
-    a(Paragraph("Market Narrative", st_h1))
-    for para in narrative.strip().split("\n\n"):
-        txt = para.strip()
-        if txt:
-            a(Paragraph(txt, st_body))
-    a(HR())
-
-    # Gas section
-    a(Paragraph("1  |  Gas Tightness", st_h1))
-    a(kv_table([
-        ("TTF M+1",            f"<b>€{m['ttf']['value']:.2f}/MWh</b>{yoy('ttf')}"),
-        ("EU Storage",         f"<b>{stor['fill_pct']:.1f}%</b> ({m['storage_gap']['value']:+.1f}pp vs 5-yr avg)"),
-        ("Required injection", f"<b>{m['injection_pace']['value']:.0f} GWh/day</b>  |  Current: {stor['trend_gwh_day']:.0f} GWh/day  |  Gap: {m['injection_pace']['pace_gap']:+.0f}"),
-        ("Norwegian supply",   "Plateau ~114.9 Bcm 2025; 2026 guide 110–120 Bcm"),
-        ("LNG shock",          "Qatar force majeure ~17% of global liquefaction (March 2026)"),
-    ]))
-    a(sp(8))
-    a(HR())
-
-    # Chart 1
-    img_w = PAGE_W - 2*M
-    img_h = img_w * 0.45
-    a(Image(str(chart1), width=img_w, height=img_h))
-    a(Paragraph(
-        f"Chart 1: EU gas storage fill % vs 5-year seasonal band. "
-        f"Current: {stor['fill_pct']:.1f}% ({m['storage_gap']['value']:+.1f}pp vs avg). "
-        f"Source: GIE AGSI+.", st_cap))
-    a(HR())
-
-    # Carbon section
-    a(Paragraph("2  |  Carbon Signal", st_h1))
-    a(kv_table([
-        ("EUA front-year",       f"<b>€{m['eua']['value']:.2f}/t</b>{yoy('eua')}"),
-        ("Carbon cost per MWh",  f"<b>€{m['carbon_per_mwh']['value']:.2f}/MWh</b>  (EUA × 0.394 tCO₂/MWh)"),
-        ("MSR withdrawal",       "275.5 Mt removed Sep 2025–Aug 2026  |  Supply tightens Sep 2026"),
-        ("ETS Directive review", "July 2026  |  Key policy catalyst"),
-    ]))
-    a(sp(8))
-    a(HR())
-
-    # Power section
-    a(Paragraph("3  |  Power Curve Implications", st_h1))
-    a(Paragraph("Clean Spark Spread:", st_h2))
-    a(Paragraph(
-        f"CSS  =  Power − (Gas ÷ η) − (EF × Carbon)  "
-        f"=  {m['de_power']['value']:.2f}  −  {m['css']['gas_cost_per_mwh']:.2f}  "
-        f"−  {m['carbon_per_mwh']['value']:.2f}  =  <b>€{m['css']['value']:.2f}/MWh</b>",
-        st_mono))
-    a(Paragraph("Implied EUA (solving CSS = 0):", st_h2))
-    a(Paragraph(
-        f"EUA*  =  (Power − Gas/η) ÷ EF  =  <b>€{m['implied_eua']['value']:.2f}/t</b>  "
-        f"vs spot €{m['eua']['value']:.2f}/t  →  gap: €{m['implied_eua']['gap']:.2f}/t",
-        st_mono))
-    a(sp(6))
-
-    # Chart 2
-    a(Image(str(chart2), width=img_w, height=img_h))
-    a(Paragraph(
-        "Chart 2: TTF M+1 (blue), EUA front-year (red, RHS), German Cal+1 baseload (green). "
-        "12-month lookback. Sources: ICE, EEX, Trading Economics.", st_cap))
-    a(HR())
-
-    # Metrics dashboard
-    a(Paragraph("4  |  Monitor Metrics Dashboard", st_h1))
-    sig_map = {"BULLISH": "▲ BULLISH", "NEUTRAL": "→ NEUTRAL", "BEARISH": "▼ BEARISH"}
-
-    def fmt_pct(v):
-        return f" ({v:+.1f}% YoY)" if v else ""
-
-    a(metrics_table([
-        ("TTF M+1 (€/MWh)",
-         f"€{m['ttf']['value']:.2f}{fmt_pct(data.get('ttf_yoy'))}",
-         sig_map[m["ttf"]["signal"]], "Primary power price input"),
-        ("EU Storage vs 5-yr avg",
-         f"{stor['fill_pct']:.1f}% ({m['storage_gap']['value']:+.1f}pp)",
-         sig_map[m["storage_gap"]["signal"]], "Low buffer amplifies demand shocks"),
-        ("Required injection pace",
-         f"{m['injection_pace']['value']:.0f} GWh/d",
-         sig_map[m["injection_pace"]["signal"]], "Gap vs target = winter risk"),
-        ("EUA front-year (€/t)",
-         f"€{m['eua']['value']:.2f}{fmt_pct(data.get('eua_yoy'))}",
-         sig_map[m["eua"]["signal"]], "+€30/MWh carbon cost in power"),
-        ("Carbon cost per MWh",
-         f"€{m['carbon_per_mwh']['value']:.2f}/MWh",
-         sig_map[m["carbon_per_mwh"]["signal"]], "Direct variable cost floor"),
-        ("Clean Spark Spread",
-         f"€{m['css']['value']:.2f}/MWh",
-         sig_map[m["css"]["signal"]], "Gas plant profitability"),
-        ("German Cal+1 baseload",
-         f"€{m['de_power']['value']:.2f}/MWh{fmt_pct(data.get('pwr_yoy'))}",
-         sig_map[m["de_power"]["signal"]], "Forward power curve anchor"),
-        ("Implied EUA in Cal+1",
-         f"€{m['implied_eua']['value']:.2f}/t (gap: €{m['implied_eua']['gap']:.2f})",
-         sig_map[m["implied_eua"]["signal"]], "Carbon unpriced in forward power"),
-    ]))
-    a(sp(8))
-    a(HR())
-
-    # Risk skew
-    a(Paragraph("5  |  Risk Skew", st_h1))
-    a(Paragraph("Upside catalysts (bullish power):", st_h2))
-    for txt in [
-        "Cold autumn onset — every 1pp below seasonal norm at 1 Nov adds ~€3–5/MWh to front-winter power.",
-        "Hormuz re-escalation — TTF could retest €60+; Cal+1 power follows within 24–48h.",
-        "Hawkish ETS Directive review (July 2026) — EUA above €90/t adds ~€6/MWh to power variable cost.",
-        "Norwegian unplanned outage — 10 bcm/day flow cut moves TTF 3–5% intraday.",
-    ]:
-        a(Paragraph(f"▲  {txt}", ParagraphStyle("bull", fontSize=8.8, leading=13,
-                    textColor=C_TEXT, leftIndent=12, spaceAfter=3)))
-    a(sp(4))
-    a(Paragraph("Downside catalysts (bearish power):", st_h2))
-    for txt in [
-        "Hormuz resolution / US-Iran deal — TTF -€8–12/MWh; Cal+1 power follows 1:1.",
-        "Warm summer and autumn — 2°C above-average Sep/Oct adds 5–8pp to storage.",
-        "US LNG wave on schedule — 2027 supply easing weighs on Cal+2 and beyond.",
-        "EUA weakness — sustained below €65/t reduces carbon floor in power by €4–6/MWh.",
-    ]:
-        a(Paragraph(f"▼  {txt}", ParagraphStyle("bear", fontSize=8.8, leading=13,
-                    textColor=C_TEXT, leftIndent=12, spaceAfter=3)))
-    a(sp(8))
-    a(HR())
-    a(Paragraph(
-        f"Data sources: GIE AGSI+, ICE/Yahoo Finance (TTF, EUA), EEX/Yahoo Finance (German power). "
-        f"Generated: {data['run_time']}. Not investment advice.",
-        st_foot))
-
-    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
-    log.info(f"  ✓ PDF saved: {out_path}")
-    return out_path
-
-
 def write_brief(data: dict, metrics: dict, prompt: str,
                 narrative: str, chart1: Path, chart2: Path) -> Path:
     """
@@ -1278,14 +945,12 @@ def main():
 
     # 5. Write daily brief
     brief_path = write_brief(data, metrics, prompt, narrative, chart1, chart2)
-    pdf_path   = write_pdf(data, metrics, narrative, chart1, chart2)
 
     log.info("")
     log.info("═" * 60)
     log.info("  DONE")
     log.info("═" * 60)
     log.info(f"  Brief:   {brief_path}")
-    log.info(f"  PDF:     {pdf_path}")
     log.info(f"  Chart 1: {chart1}")
     log.info(f"  Chart 2: {chart2}")
     log.info("")
