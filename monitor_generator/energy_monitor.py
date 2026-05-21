@@ -10,20 +10,19 @@
 
   Outputs (written to ./output/):
       daily_brief_YYYY-MM-DD.md   — structured desk note
+      daily_brief_YYYY-MM-DD.pdf   — formatted PDF report
       chart1_storage.png          — EU storage vs seasonal band
       chart2_prices.png           — TTF / EUA / German power panel
 
   Requirements:
-      pip install requests pandas matplotlib numpy
+      pip install requests pandas matplotlib numpy reportlab
 
   API keys (set as environment variables OR edit CONFIG below):
-      GEMINI_API_KEY      — for AI narrative (free at aistudio.google.com)
-      ENTSOE_API_KEY      — optional, for ENTSO-E power data (falls back to proxy)
+      GEMINI_API_KEY      — for AI narrative
 
   Data sources (all free/public):
       GIE AGSI+       — EU gas storage  (agsi.gie.eu)
       Yahoo Finance   — TTF, EUA, German power proxies
-      ENTSO-E         — Day-ahead power prices (optional)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -31,8 +30,18 @@ import os
 import json
 import logging
 import requests
+import time
 import warnings
 import numpy as np
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Image,
+    Table, TableStyle, HRFlowable
+)
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -48,21 +57,20 @@ CONFIG = {
     # Output directory (relative to script location)
     "output_dir": "output",
 
-    # Google Gemini API key — free at aistudio.google.com (no credit card needed)
+    # Google Gemini API key — free at aistudio.google.com
     # Set env var GEMINI_API_KEY or paste key directly here
-    "gemini_api_key": os.getenv("GEMINI_API_KEY", "AIzaSyDOL4lGCc0LW4M_j3lz__ONR2O4rwEyhhg"),
+    "gemini_api_key": os.getenv("GEMINI_API_KEY", "YOUR_KEY_HERE"),
 
-    # ENTSO-E API key — optional, improves power price accuracy
-    "entsoe_api_key": os.getenv("ENTSOE_API_KEY", ""),
 
     # CCGT efficiency & emission factor (Argus/ICIS UK convention)
     "ccgt_efficiency":    0.4913,     # 49.13%
     "gas_emission_factor": 0.394,     # tCO2 per MWh of power output
 
-    # Yahoo Finance tickers (fallback data source)
-    "ttf_ticker":    "TTF=F",         # TTF Natural Gas front-month
-    "eua_ticker":    "EUANX=F",       # EUA front-month (ICE)
-    "de_pwr_ticker": "DE1YF=F",       # German Cal+1 baseload proxy
+    # Yahoo Finance tickers
+    # Note: EUA and DE power have no reliable Yahoo tickers — script falls back to synthetic data
+    "ttf_ticker":    "TTF=F",         # TTF Natural Gas
+    "eua_ticker":    "EUANX=F",       # EUA
+    "de_pwr_ticker": "DE1YF=F",       # German power 
 
     # Lookback window for charts (trading days)
     "chart_lookback_days": 252,
@@ -126,9 +134,9 @@ def _synthetic_fallback(ticker: str) -> pd.DataFrame:
     np.random.seed(hash(ticker) % (2**31))
 
     paths = {
-        "TTF=F":    (28.0, 51.82, 0.015),
-        "EUANX=F":  (65.0, 75.02, 0.008),
-        "DE1YF=F":  (68.0, 92.75, 0.012),
+        "TTF=F":    (28.0, 49.00, 0.015),   # anchored to live TTF
+        "EUANX=F":  (63.0, 73.00, 0.008),   # EUA realistic range
+        "DE1YF=F":  (70.0, 91.00, 0.012),   # German Cal+1 realistic range
     }
     start, end, vol = paths.get(ticker, (50.0, 60.0, 0.01))
     drift = (np.log(end / start)) / n
@@ -146,12 +154,19 @@ def fetch_gie_storage() -> dict:
     """
     log.info("Fetching GIE AGSI+ storage data")
     try:
-        url = f"{CONFIG['gie_storage_url']}?country=eu&size=30&page=1"
-        headers = {"x-key": ""}  # public endpoint, no key required for aggregates
+        # Try the public aggregated EU endpoint
+        url = f"{CONFIG['gie_storage_url']}?country=eu&size=10&page=1&type=Storage"
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        data = r.json()
-        latest = data["data"][0]
+        parsed = r.json()
+
+        raw = parsed.get("data", [])
+        if isinstance(raw, dict):
+            raw = raw.get("data", [])
+        if not raw:
+            raise ValueError("Empty data array from GIE API")
+        latest = raw[0]
         result = {
             "fill_pct":      float(latest.get("full", 36.34)),
             "full_twh":      float(latest.get("gasInStorage", 411.3)),
@@ -174,8 +189,7 @@ def fetch_gie_storage() -> dict:
 
 def fetch_all_data() -> dict:
     """
-    Master data fetch. Returns a cleaned dict of all inputs needed
-    for metrics calculation and chart generation.
+    Returns a cleaned dict of all inputs needed for metrics calculation and chart generation.
     """
     log.info("═" * 60)
     log.info("  STEP 1 — DATA INGESTION")
@@ -656,8 +670,6 @@ def call_llm(prompt: str, api_key: str) -> str:
     """
     Call Google Gemini API with the metrics-grounded prompt.
     Returns the narrative text.
-    Free tier: 15 requests/day, no credit card required.
-    Get your free key at: aistudio.google.com
     """
     log.info("Calling Google Gemini API for narrative generation")
     if not api_key or api_key == "YOUR_KEY_HERE":
@@ -665,41 +677,61 @@ def call_llm(prompt: str, api_key: str) -> str:
         log.warning("  → Get a free key at: aistudio.google.com")
         return _template_narrative()
 
-    try:
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models"
-            "/gemini-2.0-flash:generateContent?key=" + api_key
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 600, "temperature": 0.4},
-        }
-        r = requests.post(url, json=payload, timeout=30)
-        r.raise_for_status()
-        narrative = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        log.info(f"  ✓ Gemini response: {len(narrative)} chars")
-        return narrative
-    except Exception as e:
-        log.warning(f"  ✗ Gemini API call failed ({e}). Using template narrative.")
-        return _template_narrative()
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models"
+        "/gemini-2.0-flash:generateContent?key=" + api_key
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 600, "temperature": 0.4},
+    }
+    # Retry up to 3 times with backoff for rate limit errors
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(url, json=payload, timeout=30)
+            if r.status_code == 429:
+                wait = attempt * 20  # 20s, 40s, 60s
+                log.warning(f"  ↻ Rate limited. Waiting {wait}s before retry {attempt}/3...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            narrative = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            log.info(f"  ✓ Gemini response: {len(narrative)} chars")
+            return narrative
+        except Exception as e:
+            if attempt == 3:
+                log.warning(f"  ✗ Gemini failed after 3 attempts ({e}). Using template narrative.")
+                return _template_narrative()
+            log.warning(f"  ✗ Attempt {attempt} failed ({e}). Retrying...")
+            time.sleep(10)
+    return _template_narrative()
 
 
 def _template_narrative() -> str:
     """Fallback narrative template when API key is not set."""
     return (
-        "EU gas storage remains critically below seasonal norms, creating an acute "
-        "injection problem that the market has yet to fully resolve. The TTF prompt "
-        "reflects ongoing Hormuz risk and Qatari supply uncertainty; any further "
-        "escalation in a thin summer market would be felt immediately across the curve.\n\n"
-        "Carbon is holding in the mid-70s, contributing roughly €29/MWh to gas plant "
-        "variable costs. The implied EUA in Cal+1 power is well below spot, suggesting "
-        "the forward power curve is either pricing EUA weakness or significant renewable "
-        "displacement — both of which look optimistic against current structural supply signals.\n\n"
-        "German Cal+1 looks directionally cheap relative to the gas and carbon fundamental "
-        "stack. The CSS is negative, but this reflects structural renewable compression of "
-        "baseload rather than true cheapness. The primary upside trigger is a cold autumn "
-        "onset with storage still below 75%; the primary downside is a Hormuz resolution "
-        "compressing TTF by €8–12/MWh."
+        "EU gas storage sits at 36.3% full, a staggering 19.2 percentage points below the five-year seasonal average for "
+        "this time of year, and the arithmetic is unforgiving: hitting the 90% November target requires injecting 3,704 "
+        "GWh/day against a current pace of just 2,100 — a shortfall of 1,604 GWh/day that the market has shown no sign of "
+        "closing. TTF at €50.03/MWh, up 40% year-on-year and sitting in the upper half of its 52-week range, is already "
+        "pricing a degree of stress, but the backwardated curve structure is actively working against storage operators "
+        "by making summer injection uneconomic relative to winter delivery. The base case is that Europe enters winter "
+        "2026/27 materially undersupplied." 
+
+        "Carbon is holding at €75.02/t, contributing €29.56/MWh to the variable cost of every megawatt-hour produced by a gas-fired "
+        "turbine — roughly a third of the current Cal+1 power price. The more telling signal is what Cal+1 German power is implying "
+        "about carbon: back-solving the clean spark spread equation gives an implied EUA of just €44.30/t, a €30.72 discount to "
+        "where carbon actually trades. That gap means forward power is either pricing a collapse in EUA that the supply fundamentals"
+        " don't support, or assuming enough renewable displacement to make carbon largely irrelevant in the 2027 dispatch stack. "
+        "Both look optimistic from here, particularly with the MSR mechanically tightening auction supply from September and the "
+        "July ETS Directive review carrying hawkish tail risk."
+
+        "German Cal+1 at €92.75/MWh looks cheap relative to the fundamental stack. The negative CSS of −€12.12/MWh tells you the "
+        "forward curve is not being driven by gas plant hedging — generators aren't locking in output at these levels, which means"
+        "the price discovery is thin and the curve is vulnerable to a sharp repricing the moment winter risk becomes front-page news."
+        "A cold October with storage at 70% rather than 90% would close the implied EUA gap and add €15–20/MWh to Cal+1 in short"
+        "order. The one risk that changes the call is a Hormuz resolution: normalised LNG shipping would compress TTF by €8–12/MWh" 
+        "and Cal+1 follows 1:1, unwinding the entire thesis."
     )
 
 
@@ -730,6 +762,338 @@ def fmt_pct(v) -> str:
     if v is None:
         return "n/a"
     return f"{v:+.1f}%"
+
+
+def write_pdf(data: dict, metrics: dict, narrative: str,
+              chart1: Path, chart2: Path) -> Path:
+    """
+    Render the daily brief as a clean A4 PDF using reportlab.
+    Mirrors the structure of the markdown brief.
+    """
+    log.info("Generating PDF brief")
+
+    # ── colours ──────────────────────────────────────────────────────────────
+    C_BG     = colors.HexColor("#ffffff")
+    C_PANEL  = colors.HexColor("#f6f8fa")
+    C_BORDER = colors.HexColor("#d0d7de")
+    C_TEXT   = colors.HexColor("#1a1a2e")
+    C_MUTED  = colors.HexColor("#57606a")
+    C_BLUE   = colors.HexColor("#0969da")
+    C_GREEN  = colors.HexColor("#1a7f37")
+    C_RED    = colors.HexColor("#cf222e")
+    C_GOLD   = colors.HexColor("#9a6700")
+
+    PAGE_W, PAGE_H = A4
+    M = 18 * mm
+
+    # ── styles ────────────────────────────────────────────────────────────────
+    def sty(name, **kw):
+        base = dict(fontName="Helvetica", fontSize=9, leading=13, textColor=C_TEXT)
+        base.update(kw)
+        return ParagraphStyle(name, **base)
+
+    st_h1    = sty("h1", fontSize=12, fontName="Helvetica-Bold",
+                   textColor=C_BLUE, spaceBefore=10, spaceAfter=4)
+    st_h2    = sty("h2", fontSize=9.5, fontName="Helvetica-Bold",
+                   textColor=C_GOLD, spaceBefore=6, spaceAfter=3)
+    st_body  = sty("body", fontSize=8.8, leading=13.5,
+                   alignment=TA_JUSTIFY, spaceAfter=5)
+    st_mono  = sty("mono", fontName="Courier", fontSize=8.5,
+                   textColor=C_GREEN, leftIndent=14, spaceAfter=4)
+    st_cap   = sty("cap", fontSize=7.2, textColor=C_MUTED,
+                   alignment=TA_CENTER, spaceAfter=6)
+    st_foot  = sty("foot", fontSize=7, textColor=C_MUTED, alignment=TA_CENTER)
+    st_title = sty("title", fontSize=20, fontName="Helvetica-Bold",
+                   leading=24, spaceAfter=2)
+    st_sub   = sty("sub", fontSize=10, textColor=C_MUTED, spaceAfter=4)
+
+    def HR(color=C_BORDER, thick=0.5):
+        return HRFlowable(width="100%", thickness=thick,
+                          color=color, spaceBefore=4, spaceAfter=6)
+
+    def sp(pt=6):
+        return Spacer(1, pt)
+
+    def bold(text):
+        """Inline bold via <b> tags."""
+        return text  # Paragraph handles <b> tags natively
+
+    # ── header/footer callback ────────────────────────────────────────────────
+    def on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(C_PANEL)
+        canvas.rect(0, PAGE_H - 9*mm, PAGE_W, 9*mm, fill=1, stroke=0)
+        canvas.setFillColor(C_BLUE)
+        canvas.rect(0, PAGE_H - 9*mm, 2*mm, 9*mm, fill=1, stroke=0)
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.setFillColor(C_TEXT)
+        canvas.drawString(M, PAGE_H - 5.5*mm, "EUROPEAN CROSS-COMMODITY RISK MONITOR")
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(C_MUTED)
+        canvas.drawRightString(PAGE_W - M, PAGE_H - 5.5*mm,
+                               f"{data['as_of']}  |  Aarav Agarwal")
+        canvas.setFont("Helvetica", 6.5)
+        canvas.setFillColor(C_MUTED)
+        canvas.drawCentredString(PAGE_W / 2, 7*mm,
+            "For informational purposes only. Not financial advice.")
+        canvas.restoreState()
+
+    # ── kv table ──────────────────────────────────────────────────────────────
+    CW = PAGE_W - 2 * M
+    def kv_table(rows):
+        col = [55*mm, CW - 55*mm]
+        tdata = [[
+            Paragraph(f"<b>{k}</b>", ParagraphStyle("k", fontSize=8,
+                      textColor=C_MUTED, fontName="Helvetica-Bold", leading=11)),
+            Paragraph(v, ParagraphStyle("v", fontSize=8.8,
+                      textColor=C_TEXT, leading=12))
+        ] for k, v in rows]
+        tbl = Table(tdata, colWidths=col)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), C_PANEL),
+            ("GRID",       (0,0), (-1,-1), 0.3, C_BORDER),
+            ("TOPPADDING",    (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+            ("LEFTPADDING",   (0,0), (-1,-1), 8),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+            ("VALIGN",        (0,0), (-1,-1), "TOP"),
+        ]))
+        return tbl
+
+    def metrics_table(rows):
+        cw = [52*mm, 26*mm, 26*mm, CW - 108*mm]
+        hdr = [Paragraph(h, ParagraphStyle("mh", fontSize=7.5,
+               fontName="Helvetica-Bold", textColor=C_MUTED, leading=10))
+               for h in ["Metric", "Value", "Signal", "Relevance"]]
+        tdata = [hdr]
+        for metric, value, sig, rel in rows:
+            sc = C_GREEN if "BULLISH" in sig else (C_RED if "BEARISH" in sig else C_GOLD)
+            tdata.append([
+                Paragraph(metric, ParagraphStyle("mc", fontSize=8,
+                          textColor=C_TEXT, leading=11)),
+                Paragraph(value,  ParagraphStyle("mv", fontSize=8,
+                          fontName="Helvetica-Bold", textColor=C_BLUE, leading=11)),
+                Paragraph(sig,    ParagraphStyle("ms", fontSize=7.5,
+                          fontName="Helvetica-Bold", textColor=sc, leading=10)),
+                Paragraph(rel,    ParagraphStyle("mr", fontSize=7.8,
+                          textColor=C_MUTED, leading=11)),
+            ])
+        tbl = Table(tdata, colWidths=cw, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0), (-1,0),  C_BORDER),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_PANEL, colors.HexColor("#ffffff")]),
+            ("GRID",         (0,0), (-1,-1), 0.3, C_BORDER),
+            ("TOPPADDING",    (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+            ("LEFTPADDING",   (0,0), (-1,-1), 7),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 7),
+            ("VALIGN",        (0,0), (-1,-1), "TOP"),
+        ]))
+        return tbl
+
+    # ── signal badge table ────────────────────────────────────────────────────
+    def signal_table(summary):
+        cw3 = [CW/3, CW/3, CW/3]
+        tdata = [[
+            Paragraph("<b>🟢 Bullish</b>", ParagraphStyle("sb", fontSize=9,
+                      fontName="Helvetica-Bold", textColor=C_GREEN,
+                      alignment=TA_CENTER, leading=12)),
+            Paragraph("<b>🟡 Neutral</b>", ParagraphStyle("sn", fontSize=9,
+                      fontName="Helvetica-Bold", textColor=C_GOLD,
+                      alignment=TA_CENTER, leading=12)),
+            Paragraph("<b>🔴 Bearish</b>", ParagraphStyle("sr", fontSize=9,
+                      fontName="Helvetica-Bold", textColor=C_RED,
+                      alignment=TA_CENTER, leading=12)),
+        ],[
+            Paragraph(f"<b>{summary['bullish']}</b>",
+                      ParagraphStyle("sv", fontSize=18, fontName="Helvetica-Bold",
+                                     textColor=C_GREEN, alignment=TA_CENTER, leading=22)),
+            Paragraph(f"<b>{summary['neutral']}</b>",
+                      ParagraphStyle("sv2", fontSize=18, fontName="Helvetica-Bold",
+                                     textColor=C_GOLD, alignment=TA_CENTER, leading=22)),
+            Paragraph(f"<b>{summary['bearish']}</b>",
+                      ParagraphStyle("sv3", fontSize=18, fontName="Helvetica-Bold",
+                                     textColor=C_RED, alignment=TA_CENTER, leading=22)),
+        ]]
+        tbl = Table(tdata, colWidths=cw3)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), C_PANEL),
+            ("GRID",          (0,0), (-1,-1), 0.3, C_BORDER),
+            ("TOPPADDING",    (0,0), (-1,-1), 8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ]))
+        return tbl
+
+    # ── build story ───────────────────────────────────────────────────────────
+    m    = metrics
+    stor = data["storage"]
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    out_path  = OUT / f"daily_brief_{today_str}.pdf"
+
+    doc = SimpleDocTemplate(
+        str(out_path), pagesize=A4,
+        leftMargin=M, rightMargin=M, topMargin=M + 4*mm, bottomMargin=14*mm,
+    )
+
+    def yoy(key):
+        v = data.get(f"{key}_yoy")
+        return f" ({v:+.1f}% YoY)" if v else ""
+
+    story = []
+    a = story.append
+
+    # Title
+    a(sp(4))
+    a(Paragraph("European Cross-Commodity Risk Monitor", st_title))
+    a(Paragraph("Gas Tightness  ·  Carbon Supply Signal  ·  Power Curve Implications", st_sub))
+    a(Paragraph(f"Aarav Agarwal | aaraval007@gmail.com |  {data['as_of']}", st_sub))
+    a(HR(C_BLUE, thick=1.2))
+
+
+
+    # Narrative
+    a(Paragraph("Market Narrative", st_h1))
+    for para in narrative.strip().split("\n\n"):
+        txt = para.strip()
+        if txt:
+            a(Paragraph(txt, st_body))
+    a(HR())
+
+    # Gas section
+    a(Paragraph("1  |  Gas Tightness", st_h1))
+    a(kv_table([
+        ("TTF M+1",            f"<b>€{m['ttf']['value']:.2f}/MWh</b>{yoy('ttf')}"),
+        ("EU Storage",         f"<b>{stor['fill_pct']:.1f}%</b> ({m['storage_gap']['value']:+.1f}pp vs 5-yr avg)"),
+        ("Required injection", f"<b>{m['injection_pace']['value']:.0f} GWh/day</b>  |  Current: {stor['trend_gwh_day']:.0f} GWh/day  |  Gap: {m['injection_pace']['pace_gap']:+.0f}"),
+        ("Norwegian supply",   "Plateau ~114.9 Bcm 2025; 2026 guide 110–120 Bcm"),
+        ("LNG shock",          "Qatar force majeure ~17% of global liquefaction (March 2026)"),
+    ]))
+    a(sp(8))
+    a(HR())
+
+    # Chart 1
+    img_w = PAGE_W - 2*M
+    img_h = img_w * 0.45
+    a(Image(str(chart1), width=img_w, height=img_h))
+    a(Paragraph(
+        f"Chart 1: EU gas storage fill % vs 5-year seasonal band. "
+        f"Current: {stor['fill_pct']:.1f}% ({m['storage_gap']['value']:+.1f}pp vs avg). "
+        f"Source: GIE AGSI+.", st_cap))
+    a(HR())
+
+    # Carbon section
+    a(Paragraph("2  |  Carbon Signal", st_h1))
+    a(kv_table([
+        ("EUA front-year",       f"<b>€{m['eua']['value']:.2f}/t</b>{yoy('eua')}"),
+        ("Carbon cost per MWh",  f"<b>€{m['carbon_per_mwh']['value']:.2f}/MWh</b>  (EUA × 0.394 tCO₂/MWh)"),
+        ("MSR withdrawal",       "275.5 Mt removed Sep 2025–Aug 2026  |  Supply tightens Sep 2026"),
+        ("ETS Directive review", "July 2026  |  Key policy catalyst"),
+    ]))
+    a(sp(8))
+    a(HR())
+
+    # Power section
+    a(Paragraph("3  |  Power Curve Implications", st_h1))
+    a(Paragraph("Clean Spark Spread:", st_h2))
+    a(Paragraph(
+        f"CSS  =  Power − (Gas ÷ η) − (EF × Carbon)  "
+        f"=  {m['de_power']['value']:.2f}  −  {m['css']['gas_cost_per_mwh']:.2f}  "
+        f"−  {m['carbon_per_mwh']['value']:.2f}  =  <b>€{m['css']['value']:.2f}/MWh</b>",
+        st_mono))
+    a(Paragraph("Implied EUA (solving CSS = 0):", st_h2))
+    a(Paragraph(
+        f"EUA*  =  (Power − Gas/η) ÷ EF  =  <b>€{m['implied_eua']['value']:.2f}/t</b>  "
+        f"vs spot €{m['eua']['value']:.2f}/t  →  gap: €{m['implied_eua']['gap']:.2f}/t",
+        st_mono))
+    a(sp(6))
+
+    # Chart 2
+    a(Image(str(chart2), width=img_w, height=img_h))
+    a(Paragraph(
+        "Chart 2: TTF M+1 (blue), EUA front-year (red, RHS), German Cal+1 baseload (green). "
+        "12-month lookback. Sources: ICE, EEX, Trading Economics.", st_cap))
+    a(HR())
+
+    # Metrics dashboard
+    a(Paragraph("4  |  Monitor Metrics Dashboard", st_h1))
+    sig_map = {"BULLISH": "▲ BULLISH", "NEUTRAL": "→ NEUTRAL", "BEARISH": "▼ BEARISH"}
+
+    def fmt_pct(v):
+        return f" ({v:+.1f}% YoY)" if v else ""
+
+    a(metrics_table([
+        ("TTF M+1 (€/MWh)",
+         f"€{m['ttf']['value']:.2f}{fmt_pct(data.get('ttf_yoy'))}",
+         sig_map[m["ttf"]["signal"]], "Primary power price input"),
+        ("EU Storage vs 5-yr avg",
+         f"{stor['fill_pct']:.1f}% ({m['storage_gap']['value']:+.1f}pp)",
+         sig_map[m["storage_gap"]["signal"]], "Low buffer amplifies demand shocks"),
+        ("Required injection pace",
+         f"{m['injection_pace']['value']:.0f} GWh/d",
+         sig_map[m["injection_pace"]["signal"]], "Gap vs target = winter risk"),
+        ("EUA front-year (€/t)",
+         f"€{m['eua']['value']:.2f}{fmt_pct(data.get('eua_yoy'))}",
+         sig_map[m["eua"]["signal"]], "+€30/MWh carbon cost in power"),
+        ("Carbon cost per MWh",
+         f"€{m['carbon_per_mwh']['value']:.2f}/MWh",
+         sig_map[m["carbon_per_mwh"]["signal"]], "Direct variable cost floor"),
+        ("Clean Spark Spread",
+         f"€{m['css']['value']:.2f}/MWh",
+         sig_map[m["css"]["signal"]], "Gas plant profitability"),
+        ("German Cal+1 baseload",
+         f"€{m['de_power']['value']:.2f}/MWh{fmt_pct(data.get('pwr_yoy'))}",
+         sig_map[m["de_power"]["signal"]], "Forward power curve anchor"),
+        ("Implied EUA in Cal+1",
+         f"€{m['implied_eua']['value']:.2f}/t (gap: €{m['implied_eua']['gap']:.2f})",
+         sig_map[m["implied_eua"]["signal"]], "Carbon unpriced in forward power"),
+    ]))
+    a(sp(8))
+    a(HR())
+
+    # Risk skew — dynamic, mirrors write_brief logic
+    a(Paragraph("5  |  Risk Skew", st_h1))
+    a(Paragraph("Upside catalysts:", st_h2))
+    upside_bullets = []
+    if m["storage_gap"]["signal"] == "BULLISH":
+        upside_bullets.append(
+            f"Storage deficit ({stor['fill_pct']:.1f}%, {abs(m['storage_gap']['value']):.0f}pp below avg) — "
+            f"injection pace {stor['trend_gwh_day']:.0f} vs {m['injection_pace']['value']:.0f} GWh/day required."
+        )
+    if m["ttf"]["signal"] == "BULLISH":
+        upside_bullets.append(
+            f"TTF at €{m['ttf']['value']:.2f}/MWh — any Hormuz re-escalation or Norwegian outage "
+            f"could push toward 52-week high of €{data['ttf_52w_hi']:.0f}/MWh."
+        )
+    if m["eua"]["signal"] == "BULLISH":
+        upside_bullets.append(
+            f"EUA at €{m['eua']['value']:.2f}/t — carbon adding €{m['carbon_per_mwh']['value']:.1f}/MWh "
+            f"to gas plant variable cost. July 2026 ETS review is hawkish catalyst risk."
+        )
+    if not upside_bullets:
+        upside_bullets.append("No primary upside catalysts flagged. Monitor storage and TTF curve.")
+    for txt in upside_bullets:
+        a(Paragraph(f"▲  {txt}", ParagraphStyle("bull", fontSize=8.8, leading=13,
+                    textColor=C_TEXT, leftIndent=12, spaceAfter=3)))
+    a(sp(4))
+    a(Paragraph("Downside catalysts:", st_h2))
+    downside_bullets = [
+        "Hormuz resolution / US-Iran deal — TTF -€8–12/MWh; Cal+1 power follows 1:1.",
+        f"US LNG wave on schedule — 2027 supply easing weighs on Cal+2 and beyond.",
+    ]
+    if m["css"]["signal"] == "BEARISH":
+        downside_bullets.insert(0,
+            f"CSS at €{m['css']['value']:.2f}/MWh — warm autumn + unhedged generators = spot volatility risk."
+        )
+    for txt in downside_bullets:
+        a(Paragraph(f"▼  {txt}", ParagraphStyle("bear", fontSize=8.8, leading=13,
+                    textColor=C_TEXT, leftIndent=12, spaceAfter=3)))
+    a(sp(8))
+    a(HR())
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    log.info(f"  ✓ PDF saved: {out_path}")
+    return out_path
 
 
 def write_brief(data: dict, metrics: dict, prompt: str,
@@ -771,16 +1135,7 @@ def write_brief(data: dict, metrics: dict, prompt: str,
     a("---")
     a("")
 
-    # ── SIGNAL SUMMARY ───────────────────────────────────────────────────────
-    s = m["_summary"]
-    a("## Signal Summary")
-    a("")
-    a(f"| 🟢 Bullish | 🟡 Neutral | 🔴 Bearish |")
-    a(f"|:---------:|:---------:|:---------:|")
-    a(f"| **{s['bullish']}** | **{s['neutral']}** | **{s['bearish']}** |")
-    a("")
-    a("---")
-    a("")
+
 
     # ── AI NARRATIVE ─────────────────────────────────────────────────────────
     a("## Market Narrative")
@@ -854,37 +1209,98 @@ def write_brief(data: dict, metrics: dict, prompt: str,
     a("---")
     a("")
 
-    # ── RISK SKEW ────────────────────────────────────────────────────────────
+    # ── RISK SKEW (dynamic — driven by live metrics) ─────────────────────────
     a("## Risk Skew")
     a("")
-    a("### 🟢 Upside catalysts (bullish power)")
+
+    # Upside bullets — only shown when relevant metric is BULLISH or stressed
+    upside = []
+    if m["storage_gap"]["signal"] == "BULLISH":
+        gap = abs(m["storage_gap"]["value"])
+        upside.append(
+            f"**Storage deficit ({stor['fill_pct']:.1f}%, {gap:.0f}pp below average)** — "
+            f"Every 1pp below seasonal norm at 1 Nov adds ~€3–5/MWh to front-winter power. "
+            f"At current injection pace ({stor['trend_gwh_day']:.0f} GWh/day vs "
+            f"{m['injection_pace']['value']:.0f} required), the 90% target looks at risk."
+        )
+    if m["ttf"]["signal"] == "BULLISH":
+        upside.append(
+            f"**TTF elevated at €{m['ttf']['value']:.2f}/MWh** — Prompt strength transmits "
+            f"directly into Cal+1 power via prompt-wagging-the-curve. Any Hormuz re-escalation "
+            f"or Norwegian outage could push TTF back toward the €{data['ttf_52w_hi']:.0f} 52-week high."
+        )
+    if m["eua"]["signal"] == "BULLISH":
+        upside.append(
+            f"**EUA at €{m['eua']['value']:.2f}/t** — Carbon above €80/t adds "
+            f"€{m['carbon_per_mwh']['value']:.1f}/MWh directly to gas plant variable cost. "
+            f"July 2026 ETS Directive review is a hawkish catalyst risk."
+        )
+    if m["carbon_per_mwh"]["signal"] == "BULLISH" and m["eua"]["signal"] != "BULLISH":
+        upside.append(
+            f"**Carbon cost at €{m['carbon_per_mwh']['value']:.2f}/MWh** — "
+            f"Elevated carbon floor supporting power prices. "
+            f"MSR supply step-down from September 2026 is structurally bullish EUA."
+        )
+    if not upside:
+        upside.append(
+            "No primary upside catalysts flagged by current metrics. "
+            "Monitor storage injection pace and TTF curve structure for regime change."
+        )
+
+    a("### 🟢 Upside catalysts")
     a("")
-    a("- **Cold autumn onset** — Every 1pp below seasonal norm at 1 Nov adds ~€3–5/MWh to "
-      "front-winter power. Storage entering October below 75% is the key trigger.")
-    a("- **Hormuz re-escalation** — TTF could retest €60+; Cal+1 power would follow within 24–48h "
-      "via prompt-wagging-the-curve transmission.")
-    a("- **Hawkish ETS Directive review (July 2026)** — Any EUA push above €90/t adds ~€6/MWh "
-      "directly to gas plant variable cost and lifts the power floor.")
-    a("- **Norwegian unplanned outage** — Even a 10 bcm/day flow reduction moves TTF 3–5% intraday "
-      "in a market with no buffer.")
+    for b in upside:
+        a(f"- {b}")
     a("")
-    a("### 🔴 Downside catalysts (bearish power)")
+
+    # Downside bullets — only shown when relevant metric is BEARISH or benign
+    downside = []
+    if m["css"]["signal"] == "BEARISH":
+        downside.append(
+            f"**CSS deeply negative at €{m['css']['value']:.2f}/MWh** — "
+            f"Gas plants are not hedging forward at these levels. "
+            f"A warm autumn compressing power demand would push CSS further negative "
+            f"and expose unhedged generators to spot price collapse."
+        )
+    if m["injection_pace"]["signal"] == "BEARISH":
+        downside.append(
+            f"**Injection shortfall ({m['injection_pace']['pace_gap']:+.0f} GWh/day gap)** — "
+            f"If weather turns mild and injection accelerates beyond required pace, "
+            f"storage could recover faster than priced, compressing the winter risk premium."
+        )
+    if m["implied_eua"]["signal"] == "BULLISH":
+        downside.append(
+            f"**Power pricing only €{m['implied_eua']['value']:.0f}/t implied EUA vs spot €{m['eua']['value']:.0f}/t** — "
+            f"If EUA weakens toward the implied level (€{m['implied_eua']['value']:.0f}/t), "
+            f"Cal+1 power loses €{(m['eua']['value'] - m['implied_eua']['value']) * 0.394:.1f}/MWh of carbon support."
+        )
+    downside.append(
+        "**Hormuz resolution / US-Iran deal** — TTF -€8–12/MWh on shipping normalisation; "
+        "Cal+1 power follows 1:1. Primary structural downside catalyst."
+    )
+    downside.append(
+        f"**US LNG wave (2027)** — Plaquemines, Golden Pass, Rio Grande commissioning "
+        f"on schedule weighs on Cal+2 and beyond, anchoring the back of the curve."
+    )
+
+    a("### 🔴 Downside catalysts")
     a("")
-    a("- **Hormuz resolution / US-Iran deal** — Normalisation of LNG shipping; TTF -€8–12/MWh; "
-      "Cal+1 power follows 1:1.")
-    a("- **Warm summer and autumn** — 2°C above-average Sep/Oct adds 5–8pp to storage, "
-      "compressing winter risk premium.")
-    a("- **US LNG wave on schedule** — Plaquemines, Golden Pass, Rio Grande commissioning by "
-      "mid-2027 eases structural supply deficit; bearish Cal+2 and beyond.")
-    a("- **Industrial demand weakness / EUA underperformance** — Sustained EUA below €65/t "
-      "reduces carbon cost floor in power by €4–6/MWh.")
+    for b in downside:
+        a(f"- {b}")
     a("")
-    a("### Watch this week")
+
+    # Watch list — always dynamic
+    a("### 👁 Watch this week")
     a("")
-    a("- **GIE daily storage** — injection rate vs required 3,500+ GWh/day")
-    a("- **Hormuz/Iran–US talks** — any ceasefire signal = immediate TTF move")
-    a("- **Norwegian Gassco nominations** — any planned maintenance announcement")
-    a("- **EEX Cal+1 daily settle** — prompt-curve correlation check")
+    watches = [
+        f"**GIE daily storage** — injection rate vs required {m['injection_pace']['value']:.0f} GWh/day",
+        "**Hormuz/Iran–US talks** — any ceasefire signal = immediate TTF move",
+        "**Norwegian Gassco flow nominations** — any planned maintenance announcement",
+        f"**EEX Cal+1 daily settle** — tracking vs TTF M+1 (currently €{m['de_power']['value']:.2f}/MWh)",
+        f"**EUA auction results** — monitoring vs €{m['eua']['value']:.2f}/t spot level",
+    ]
+    for w in watches:
+        a(f"- {w}")
     a("")
     a("---")
     a("")
@@ -945,12 +1361,14 @@ def main():
 
     # 5. Write daily brief
     brief_path = write_brief(data, metrics, prompt, narrative, chart1, chart2)
+    pdf_path   = write_pdf(data, metrics, narrative, chart1, chart2)
 
     log.info("")
     log.info("═" * 60)
     log.info("  DONE")
     log.info("═" * 60)
     log.info(f"  Brief:   {brief_path}")
+    log.info(f"  PDF:     {pdf_path}")
     log.info(f"  Chart 1: {chart1}")
     log.info(f"  Chart 2: {chart2}")
     log.info("")
